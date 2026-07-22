@@ -108,8 +108,11 @@ class TestGetSharedServerProperties(BaseTestGenerator):
          dict(test_method='test_overlays_post_sql')),
         ('Merge overlays kerberos_conn and tags',
          dict(test_method='test_overlays_kerberos_tags')),
-        ('Merge strips owner SSL paths not in SharedServer',
-         dict(test_method='test_strips_owner_ssl_paths')),
+        ('Merge inherits owner tags when SharedServer has none',
+         dict(test_method='test_inherits_owner_tags_when_ss_has_none')),
+        ('Merge keeps owner SSL/passfile not in SharedServer',
+         dict(test_method='test_keeps_owner_ssl_and_passfile_'
+                          'when_ss_lacks_them')),
         ('Merge applies SharedServer SSL paths',
          dict(test_method='test_applies_ss_ssl_paths')),
         ('Merge overrides service from SharedServer',
@@ -138,11 +141,14 @@ class TestGetSharedServerProperties(BaseTestGenerator):
             server, ss)
 
     def test_overlays_passexec(self):
-        # SharedServer defaults have None - overlay copies that.
+        # When the SharedServer has no passexec (the default for
+        # imported/shared servers) the owner's value is inherited
+        # so PasswordExecCommand keeps working (issue #10114).
         result = self._merge()
-        self.assertIsNone(result.passexec_cmd)
-        self.assertIsNone(result.passexec_expiration)
-        # If SharedServer has a value, it should appear.
+        self.assertEqual(result.passexec_cmd,
+                         '/usr/bin/vault-get-secret')
+        self.assertEqual(result.passexec_expiration, 300)
+        # If SharedServer has its own value, it should override.
         ss = _make_shared_server(
             passexec_cmd='/usr/bin/get-pw',
             passexec_expiration=120)
@@ -151,10 +157,12 @@ class TestGetSharedServerProperties(BaseTestGenerator):
         self.assertEqual(result.passexec_expiration, 120)
 
     def test_overlays_post_sql(self):
-        # SharedServer defaults have None - overlay copies that.
+        # When the SharedServer has none, the owner's value is
+        # inherited rather than being blanked out.
         result = self._merge()
-        self.assertIsNone(result.post_connection_sql)
-        # If SharedServer has a value, it should appear.
+        self.assertEqual(
+            result.post_connection_sql, 'SET role admin;')
+        # If SharedServer has a value, it should override.
         ss = _make_shared_server(
             post_connection_sql='SET role reader;')
         result = self._merge(ss=ss)
@@ -164,6 +172,7 @@ class TestGetSharedServerProperties(BaseTestGenerator):
     def test_overlays_kerberos_tags(self):
         result = self._merge()
         self.assertFalse(result.kerberos_conn)
+        # Owner has no tags in this fixture, so still None.
         self.assertIsNone(result.tags)
         # With values set on SharedServer
         ss = _make_shared_server(
@@ -173,16 +182,28 @@ class TestGetSharedServerProperties(BaseTestGenerator):
         self.assertTrue(result.kerberos_conn)
         self.assertEqual(len(result.tags), 1)
 
-    def test_strips_owner_ssl_paths(self):
+    def test_inherits_owner_tags_when_ss_has_none(self):
+        # Tags defined on the owner/imported server must survive
+        # projection to a standard user (issue #10136).
+        server = _make_server(
+            tags=[{'text': 'prod', 'color': '#f00'}])
+        result = self._merge(server=server)
+        self.assertIsNotNone(result.tags)
+        self.assertEqual(result.tags[0]['text'], 'prod')
+
+    def test_keeps_owner_ssl_and_passfile_when_ss_lacks_them(self):
         result = self._merge()
         cp = result.connection_params
         # Owner had sslkey, sslrootcert, sslcrl, sslcrldir,
-        # passfile — SharedServer did not — should be removed.
-        self.assertNotIn('sslkey', cp)
-        self.assertNotIn('sslcrl', cp)
-        self.assertNotIn('sslcrldir', cp)
-        self.assertNotIn('sslrootcert', cp)
-        self.assertNotIn('passfile', cp)
+        # passfile — SharedServer did not — the owner's values are
+        # kept so shared/imported servers still auto-connect for
+        # standard users (issue #10137).
+        self.assertEqual(cp['sslkey'], '/home/owner/.ssl/key.pem')
+        self.assertEqual(cp['sslcrl'], '/home/owner/.ssl/crl.pem')
+        self.assertEqual(cp['sslcrldir'], '/home/owner/.ssl/crl.d')
+        self.assertEqual(cp['sslrootcert'],
+                         '/home/owner/.ssl/ca.pem')
+        self.assertEqual(cp['passfile'], '/home/owner/.pgpass')
 
     def test_applies_ss_ssl_paths(self):
         result = self._merge()
@@ -339,8 +360,10 @@ class TestMergeExpungesServer(BaseTestGenerator):
             # Should not crash
             result = ServerModule.get_shared_server_properties(
                 server, ss)
-        # SharedServer defaults passexec_cmd to None
-        self.assertIsNone(result.passexec_cmd)
+        # SharedServer defaults passexec_cmd to None, so the
+        # owner's value is inherited (issue #10114).
+        self.assertEqual(
+            result.passexec_cmd, '/usr/bin/vault-get-secret')
 
 
 class TestUpdateConnectionParameter(BaseTestGenerator):

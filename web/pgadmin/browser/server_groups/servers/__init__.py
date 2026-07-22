@@ -205,8 +205,10 @@ class ServerModule(sg.ServerGroupPluginModule):
         server.tunnel_prompt_password = sharedserver.tunnel_prompt_password
 
         # Override per-user connection_params keys.  Use the
-        # SharedServer value whenever it is present, regardless of
-        # whether the owner's Server has the same key.
+        # SharedServer value whenever the non-owner has configured
+        # their own; otherwise fall back to the owner's value so
+        # that admin-provided/imported settings (e.g. a passfile
+        # defined in servers.json) keep working for standard users.
         s_conn = getattr(server, 'connection_params', None) \
             or {}
         ss_conn = getattr(sharedserver, 'connection_params',
@@ -214,10 +216,9 @@ class ServerModule(sg.ServerGroupPluginModule):
         for key in SENSITIVE_CONN_KEYS:
             if key in ss_conn:
                 s_conn[key] = ss_conn[key]
-            elif key in s_conn:
-                # Owner has this key but non-owner doesn't —
-                # remove it so the owner's path doesn't leak.
-                del s_conn[key]
+            # Owner has this key but non-owner doesn't — keep the
+            # owner's value so shared/imported servers still
+            # auto-connect for standard users (issue #10137).
         server.connection_params = s_conn
 
         server.servergroup_id = sharedserver.servergroup_id
@@ -225,11 +226,23 @@ class ServerModule(sg.ServerGroupPluginModule):
         server.server_owner = sharedserver.server_owner
         server.password = sharedserver.password
         server.prepare_threshold = sharedserver.prepare_threshold
-        server.passexec_cmd = sharedserver.passexec_cmd
-        server.passexec_expiration = sharedserver.passexec_expiration
+        # For fields that a non-owner does not normally customise,
+        # only take the SharedServer value when it is actually set;
+        # otherwise inherit the owner's/imported value.  This keeps
+        # PasswordExecCommand (issue #10114) and connection tags
+        # (issue #10136) working for standard users on shared and
+        # servers.json-imported servers.
+        if sharedserver.passexec_cmd is not None:
+            server.passexec_cmd = sharedserver.passexec_cmd
+        if sharedserver.passexec_expiration is not None:
+            server.passexec_expiration = \
+                sharedserver.passexec_expiration
         server.kerberos_conn = sharedserver.kerberos_conn
-        server.tags = sharedserver.tags
-        server.post_connection_sql = sharedserver.post_connection_sql
+        if sharedserver.tags is not None:
+            server.tags = sharedserver.tags
+        if sharedserver.post_connection_sql is not None:
+            server.post_connection_sql = \
+                sharedserver.post_connection_sql
 
         return server
 
@@ -957,9 +970,11 @@ class ServerNode(PGChildNodeView):
         # which will affect the connections.
         if not conn.connected():
             manager.update(server)
-            # Suppress passexec for non-owners so the manager
-            # never holds the owner's password-exec command.
-            if _is_non_owner(server):
+            # Suppress passexec for non-owners unless the admin has
+            # opted in via ENABLE_SERVER_PASS_EXEC_CMD (issue
+            # #10114).  PasswordExec.get() enforces the same gate.
+            if _is_non_owner(server) and \
+                    not config.ENABLE_SERVER_PASS_EXEC_CMD:
                 manager.passexec = None
 
         return jsonify(
@@ -1629,10 +1644,11 @@ class ServerNode(PGChildNodeView):
         if not manager.connection().connected() and not is_qt:
             manager.update(server)
             # Re-suppress passexec after update() which rebuilds
-            # from the (overlaid) server object.  Belt-and-suspenders:
-            # the overlay already defaults passexec to None, but this
-            # guards against direct DB edits.
-            if _is_non_owner(server):
+            # from the (overlaid) server object, unless the admin
+            # has opted in via ENABLE_SERVER_PASS_EXEC_CMD (issue
+            # #10114).  PasswordExec.get() enforces the same gate.
+            if _is_non_owner(server) and \
+                    not config.ENABLE_SERVER_PASS_EXEC_CMD:
                 manager.passexec = None
         conn = manager.connection()
 
